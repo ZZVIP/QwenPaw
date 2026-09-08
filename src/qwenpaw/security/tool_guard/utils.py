@@ -126,6 +126,54 @@ def resolve_denied_tools(
     return set()
 
 
+# Only catastrophic wipe/mkfs/dd findings hard-deny by default.
+# ``SAFETY_CHECKS_SYSTEM_POWER`` is intentionally excluded so bare-word
+# matches cannot turn ``npm run reboot`` into an unconditional DENY.
+_DEFAULT_AUTO_DENIED_RULES: frozenset[str] = frozenset(
+    {"SAFETY_CHECKS_DESTRUCTIVE_COMMAND"},
+)
+
+# Env / config tokens that explicitly opt out of auto-deny.
+_AUTO_DENY_OPT_OUT = frozenset({"none", "-", "off", "disable", "disabled"})
+
+
+def resolve_auto_denied_rules(
+    user_defined: set[str] | list[str] | tuple[str, ...] | None = None,
+) -> set[str]:
+    """Resolve rule IDs that should trigger unconditional auto-deny.
+
+    Priority:
+    1) constructor-provided ``user_defined``
+    2) ``QWENPAW_TOOL_GUARD_AUTO_DENIED_RULES`` env var (comma-separated;
+       ``none`` / ``-`` / ``off`` disables auto-deny)
+    3) ``config.json`` -> ``security.tool_guard.auto_denied_rules``
+       (non-empty list wins; ``[]`` / omitted / ``None`` → built-in default
+       so legacy persisted empty lists still get catastrophic hard-deny)
+    4) built-in default (``SAFETY_CHECKS_DESTRUCTIVE_COMMAND``)
+
+    Returns
+    -------
+    set[str]
+        Rule IDs that should auto-reject tool calls once matched.
+    """
+    if user_defined is not None:
+        return {r.strip() for r in user_defined if r and r.strip()}
+
+    raw = EnvVarLoader.get_str("QWENPAW_TOOL_GUARD_AUTO_DENIED_RULES") or None
+    if raw is not None:
+        tokens = {r.strip() for r in raw.split(",") if r.strip()}
+        if tokens and tokens <= _AUTO_DENY_OPT_OUT:
+            return set()
+        return tokens
+
+    cfg = _load_config_tool_guard()
+    configured_rules = getattr(cfg, "auto_denied_rules", None)
+    if configured_rules:
+        return {r.strip() for r in configured_rules if r.strip()}
+
+    return set(_DEFAULT_AUTO_DENIED_RULES)
+
+
 def log_findings(tool_name: str, result: "ToolGuardResult") -> None:
     """Emit structured logs for each finding."""
     from .models import GuardSeverity

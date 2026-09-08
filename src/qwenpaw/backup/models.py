@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
 from ._utils.meta import generate_backup_id
+from ..exceptions import BackupConflictError, BackupValidationError
+
+BackupTrustMode = Literal["legacy", "foreign"]
 
 
 class BackupScope(BaseModel):
@@ -53,6 +57,17 @@ class BackupMeta(BaseModel):
         default_factory=dict,
         description="System information (OS, Python version, etc.)",
     )
+    signature: Optional[str] = Field(
+        default=None,
+        description="Backup HMAC signature in '<scheme>:<hex>' format",
+    )
+    accepted_via_trust: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Trust state marker: None=legacy/unknown, False=local signed, "
+            "True=accepted after explicit legacy/foreign trust."
+        ),
+    )
 
 
 class CreateBackupRequest(BaseModel):
@@ -64,6 +79,40 @@ class CreateBackupRequest(BaseModel):
         description="Agent IDs to include when scope.include_agents is True. "
         "Must be the explicit list (even for 'all agents').",
     )
+
+
+class BackupJobStatus(str, Enum):
+    """Lifecycle state for an application-owned backup creation job."""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    CANCEL_REQUESTED = "cancel_requested"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class BackupJobPhase(str, Enum):
+    """Coarse backup phase used for reconnectable progress reporting."""
+
+    PREPARING = "preparing"
+    AGENTS = "agents"
+    FINALIZING = "finalizing"
+
+
+class BackupJobSnapshot(BaseModel):
+    """Serializable current state of a backup creation job."""
+
+    job_id: str
+    backup_id: str
+    status: BackupJobStatus = BackupJobStatus.PENDING
+    phase: BackupJobPhase = BackupJobPhase.PREPARING
+    percent: int = 0
+    current_agent: Optional[str] = None
+    agent_index: int = 0
+    total_agents: int = 0
+    result: Optional[BackupMeta] = None
+    error: Optional[str] = None
 
 
 class RestoreBackupRequest(BaseModel):
@@ -106,6 +155,22 @@ class RestoreBackupRequest(BaseModel):
             "ghost entries when include_agents is False."
         ),
     )
+    preserve_local_protected_config: Optional[bool] = Field(
+        default=None,
+        description=(
+            "When None, preserve local critical settings for explicitly "
+            "trusted legacy/foreign backups and fully restore local signed "
+            "backups."
+        ),
+    )
+    trust_mode: Optional[BackupTrustMode] = Field(
+        default=None,
+        description=(
+            "Explicit trust action for backups that are not locally signed: "
+            "'legacy' for unsigned legacy backups, 'foreign' for backups "
+            "signed by another instance."
+        ),
+    )
 
 
 class DeleteBackupsRequest(BaseModel):
@@ -124,9 +189,10 @@ class BackupDetail(BackupMeta):
     )
 
 
-class BackupConflictError(Exception):
-    """Raised when an imported backup's ID already exists on disk."""
-
-    def __init__(self, existing_meta: BackupMeta) -> None:
-        self.existing_meta = existing_meta
-        super().__init__(f"backup_conflict: {existing_meta.id}")
+__all__ = [
+    "BackupConflictError",
+    "BackupMeta",
+    "BackupTrustMode",
+    "BackupValidationError",
+    "RestoreBackupRequest",
+]

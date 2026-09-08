@@ -5,6 +5,8 @@ export interface BackupScope {
   include_skill_pool: boolean;
 }
 
+export type BackupTrustMode = "legacy" | "foreign";
+
 export interface BackupMeta {
   id: string;
   name: string;
@@ -12,6 +14,8 @@ export interface BackupMeta {
   created_at: string;
   scope: BackupScope;
   agent_count: number;
+  signature?: string | null;
+  accepted_via_trust?: boolean | null;
 }
 
 export interface BackupDetail extends BackupMeta {
@@ -28,6 +32,42 @@ export interface CreateBackupRequest {
   agents: string[];
 }
 
+export type BackupJobStatus =
+  | "pending"
+  | "running"
+  | "cancel_requested"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export type BackupJobPhase = "preparing" | "agents" | "finalizing";
+
+export interface BackupJobSnapshot {
+  job_id: string;
+  backup_id: string;
+  status: BackupJobStatus;
+  phase: BackupJobPhase;
+  percent: number;
+  current_agent: string | null;
+  agent_index: number;
+  total_agents: number;
+  result: BackupMeta | null;
+  error: string | null;
+}
+
+export type BackupProgressEvent =
+  | { type: "start"; total_agents: number; percent: 0 }
+  | {
+      type: "agent";
+      agent_id: string;
+      index: number;
+      total: number;
+      percent: number;
+    }
+  | { type: "saving"; percent: number }
+  | { type: "done"; meta: BackupMeta; percent: 100 }
+  | { type: "error"; message: string };
+
 export interface RestoreBackupRequest {
   include_agents: boolean;
   agent_ids: string[];
@@ -36,6 +76,13 @@ export interface RestoreBackupRequest {
   include_skill_pool: boolean;
   default_workspace_dir?: string | null;
   mode?: "full" | "custom";
+  preserve_local_protected_config?: boolean | null;
+  trust_mode?: BackupTrustMode | null;
+}
+
+export interface RestoreBackupResponse {
+  ok: boolean;
+  preserved_local_keys: string[];
 }
 
 /**
@@ -60,21 +107,14 @@ export interface DeleteBackupsResponse {
   failed: { id: string; reason: string }[];
 }
 
-export type BackupProgressEvent =
-  | { type: "start"; total_agents: number; percent: 0 }
-  | {
-      type: "agent";
-      agent_id: string;
-      index: number;
-      total: number;
-      percent: number;
-    }
-  | { type: "saving"; percent: number }
-  | { type: "done"; meta: BackupMeta; percent: 100 }
-  | { type: "error"; message: string };
-
 export interface BackupConflictResponse {
   detail: "backup_conflict";
   existing: BackupMeta;
   pending_token: string;
+}
+
+export interface BackupValidationDetail {
+  code: string;
+  message: string;
+  locked_paths?: string[];
 }

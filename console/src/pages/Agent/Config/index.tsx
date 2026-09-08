@@ -1,23 +1,47 @@
-import { useState, useMemo, useEffect } from "react";
+import { useState, useMemo, useEffect, useCallback } from "react";
 import { Button, Form, Tabs } from "@agentscope-ai/design";
 import { useTranslation } from "react-i18next";
+import { useSearchParams } from "react-router-dom";
 import { useAgentConfig } from "./useAgentConfig.tsx";
 import {
   ReactAgentCard,
   LlmRetryCard,
   LlmRateLimiterCard,
   ToolExecutionLevelCard,
+  AgentLoopCard,
+  EmbeddingModelCard,
 } from "./components";
 import { PageHeader } from "@/components/PageHeader";
 import {
   CONTEXT_MANAGER_BACKEND_MAPPINGS,
   MEMORY_MANAGER_BACKEND_MAPPINGS,
 } from "@/constants/backendMappings";
+import api from "@/api";
+import type { AgentsRunningConfig } from "@/api/types";
+import { useAgentStore } from "@/stores/agentStore";
 import styles from "./index.module.less";
+import { MemoryMaintenanceContext } from "./memoryMaintenanceContext";
+import { useReMeRuntimeStatus } from "./useReMeRuntimeStatus";
+import { getEmbeddingConfigFingerprint } from "./components/embeddingUtils";
 
 function AgentConfigPage() {
   const { t } = useTranslation();
-  const [activeTab, setActiveTab] = useState("reactAgent");
+  const [searchParams] = useSearchParams();
+  const [activeTab, setActiveTab] = useState(
+    searchParams.get("tab") || "reactAgent",
+  );
+  const [needsReindex, setNeedsReindex] = useState(false);
+  const [localReindexing, setLocalReindexing] = useState(false);
+  const [persistedEmbeddingFingerprint, setPersistedEmbeddingFingerprint] =
+    useState<string>();
+  const syncReindexRequirement = useCallback((config: AgentsRunningConfig) => {
+    setNeedsReindex(config.reme_light_memory_config.needs_reindex === true);
+    setPersistedEmbeddingFingerprint(
+      getEmbeddingConfigFingerprint(
+        config.reme_light_memory_config.embedding_model_config,
+      ),
+    );
+  }, []);
   const {
     form,
     loading,
@@ -33,14 +57,74 @@ function AgentConfigPage() {
     handleSave,
     handleLanguageChange,
     handleTimezoneChange,
-  } = useAgentConfig();
+  } = useAgentConfig(syncReindexRequirement);
 
   const llmRetryEnabled = Form.useWatch("llm_retry_enabled", form) ?? true;
-  const maxInputLength = Form.useWatch("max_input_length", form) ?? 0;
   const contextBackend =
     Form.useWatch("context_manager_backend", form) || "light";
   const memoryBackend =
     Form.useWatch("memory_manager_backend", form) || "remelight";
+  const { selectedAgent } = useAgentStore();
+  const { runtimeStatus, diagnosticsStatus, checkMemoryStatus } =
+    useReMeRuntimeStatus(memoryBackend === "remelight");
+  const remoteReindexing =
+    runtimeStatus.type === "healthy" && runtimeStatus.data.reindexing;
+  const reindexing = localReindexing || remoteReindexing;
+
+  useEffect(() => {
+    if (runtimeStatus.type === "healthy") {
+      setNeedsReindex(runtimeStatus.data.embedding_reindex_required);
+    }
+  }, [runtimeStatus]);
+
+  const [maxInputLength, setMaxInputLength] = useState(131072);
+  const refreshEffectiveContextWindow = useCallback(() => {
+    return api
+      .getActiveModels({
+        scope: "effective",
+        agent_id: selectedAgent || undefined,
+      })
+      .then((info) => {
+        if (info.effective_max_input_length != null) {
+          setMaxInputLength(info.effective_max_input_length);
+          return;
+        }
+        if (info.active_llm) {
+          return api.listProviders().then((providers) => {
+            const provider = providers.find(
+              (p) => p.id === info.active_llm?.provider_id,
+            );
+            const all = [
+              ...(provider?.models ?? []),
+              ...(provider?.extra_models ?? []),
+            ];
+            const model = all.find(
+              (item) => item.id === info.active_llm?.model,
+            );
+            if (model?.max_input_length != null) {
+              setMaxInputLength(model.max_input_length);
+            }
+          });
+        }
+      })
+      .catch(() => {});
+  }, [selectedAgent]);
+
+  useEffect(() => {
+    refreshEffectiveContextWindow();
+  }, [refreshEffectiveContextWindow]);
+
+  useEffect(() => {
+    const handleVisibility = () => {
+      if (document.visibilityState === "visible") {
+        refreshEffectiveContextWindow();
+      }
+    };
+    document.addEventListener("visibilitychange", handleVisibility);
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibility);
+    };
+  }, [refreshEffectiveContextWindow]);
 
   const dynamicTabs = useMemo(() => {
     const baseTabs = [
@@ -61,6 +145,19 @@ function AgentConfigPage() {
               savingTimezone={savingTimezone}
               onTimezoneChange={handleTimezoneChange}
             />
+          </div>
+        ),
+      },
+      {
+        key: "agentLoop",
+        label: (
+          <span className={styles.tabLabel}>
+            {t("agentConfig.agentLoopTitle", "Agent Loop Settings")}
+          </span>
+        ),
+        children: (
+          <div className={styles.tabContent}>
+            <AgentLoopCard />
           </div>
         ),
       },
@@ -123,6 +220,22 @@ function AgentConfigPage() {
         children: (
           <div className={styles.tabContent}>
             <MemoryComponent />
+          </div>
+        ),
+      });
+    }
+
+    if (memoryBackend === "remelight") {
+      baseTabs.push({
+        key: "embeddingModel",
+        label: (
+          <span className={styles.tabLabel}>
+            {t("agentConfig.embeddingModelTitle")}
+          </span>
+        ),
+        children: (
+          <div className={styles.tabContent}>
+            <EmbeddingModelCard />
           </div>
         ),
       });
@@ -200,15 +313,30 @@ function AgentConfigPage() {
       <PageHeader parent={t("nav.agent")} current={t("agentConfig.title")} />
 
       <div className={styles.content}>
-        <Form form={form} layout="vertical" className={styles.form}>
-          <Tabs
-            className={styles.mainTabs}
-            activeKey={activeTab}
-            onChange={setActiveTab}
-            items={dynamicTabs}
-            destroyInactiveTabPane={false}
-          />
-        </Form>
+        <MemoryMaintenanceContext.Provider
+          value={{
+            needsReindex,
+            setNeedsReindex,
+            reindexing,
+            setReindexing: setLocalReindexing,
+            persistedEmbeddingFingerprint,
+            setPersistedEmbeddingFingerprint,
+            openMemorySettings: () => setActiveTab("remeLightMemory"),
+            runtimeStatus,
+            diagnosticsStatus,
+            checkMemoryStatus,
+          }}
+        >
+          <Form form={form} layout="vertical" className={styles.form}>
+            <Tabs
+              className={styles.mainTabs}
+              activeKey={activeTab}
+              onChange={setActiveTab}
+              items={dynamicTabs}
+              destroyInactiveTabPane={false}
+            />
+          </Form>
+        </MemoryMaintenanceContext.Provider>
       </div>
 
       <div className={styles.footerActions}>

@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import aiohttp
 
-from agentscope_runtime.engine.schemas.agent_schemas import (
+from qwenpaw.schemas import (
     TextContent,
     ImageContent,
     VideoContent,
@@ -36,8 +36,9 @@ from agentscope_runtime.engine.schemas.agent_schemas import (
 
 from ....config.config import QQConfig as QQChannelConfig
 from ....constant import WORKING_DIR
-from ....exceptions import ChannelError
+from ....exceptions import ChannelError, QQApiError
 
+from ..renderer import ChannelDisplayConfig
 from ..base import (
     BaseChannel,
     OnReplySent,
@@ -66,6 +67,7 @@ INTENT_PUBLIC_GUILD_MESSAGES = 1 << 30
 INTENT_DIRECT_MESSAGE = 1 << 12
 INTENT_GROUP_AND_C2C = 1 << 25
 INTENT_GUILD_MEMBERS = 1 << 1
+INTENT_INTERACTION = 1 << 26
 
 RECONNECT_DELAYS = [1, 2, 5, 10, 30, 60]
 RATE_LIMIT_DELAY = 60
@@ -196,16 +198,6 @@ class _HeartbeatController:
         self._schedule()
 
 
-class QQApiError(RuntimeError):
-    """HTTP error returned by QQ API."""
-
-    def __init__(self, path: str, status: int, data: Any):
-        self.path = path
-        self.status = status
-        self.data = data
-        super().__init__(f"API {path} {status}: {data}")
-
-
 def _is_recoverable_ws_os_error(exc: OSError) -> bool:
     """Return True for socket errors that should trigger reconnect.
 
@@ -296,6 +288,11 @@ def _get_api_base() -> str:
     return os.getenv("QQ_API_BASE", DEFAULT_API_BASE).rstrip("/")
 
 
+def _get_token_url() -> str:
+    """Token endpoint (override with QQ_TOKEN_URL, e.g. for sandboxes)."""
+    return os.getenv("QQ_TOKEN_URL", TOKEN_URL)
+
+
 def _get_channel_url_sync(access_token: str) -> str:
     import urllib.error
     import urllib.request
@@ -370,7 +367,14 @@ async def _api_request_async(
     if body is not None:
         kwargs["json"] = body
     async with session.request(method, url, **kwargs) as resp:
-        data = await resp.json()
+        # Some endpoints (e.g. PUT /interactions/{id}) return empty body.
+        raw = await resp.read()
+        data: Dict[str, Any] = {}
+        if raw and raw.strip():
+            try:
+                data = json.loads(raw)
+            except (ValueError, TypeError):
+                data = {}
         if resp.status >= 400:
             raise QQApiError(path=path, status=resp.status, data=data)
         return data
@@ -659,20 +663,22 @@ class QQChannel(BaseChannel):
         bot_prefix: str = "",
         markdown_enabled: bool = True,
         on_reply_sent: OnReplySent = None,
-        show_tool_details: bool = True,
-        filter_tool_messages: bool = False,
-        filter_thinking: bool = False,
+        display_config: ChannelDisplayConfig | None = None,
+        no_text_debounce: bool = True,
         media_dir: str = "",
         workspace_dir: Path | None = None,
         max_reconnect_attempts: int = 100,
         ack_message: str = "",
+        access_control_dm: bool = False,
+        access_control_group: bool = False,
     ):
         super().__init__(
             process,
             on_reply_sent=on_reply_sent,
-            show_tool_details=show_tool_details,
-            filter_tool_messages=filter_tool_messages,
-            filter_thinking=filter_thinking,
+            display_config=display_config,
+            no_text_debounce=no_text_debounce,
+            access_control_dm=access_control_dm,
+            access_control_group=access_control_group,
         )
         self.enabled = enabled
         self.app_id = app_id
@@ -702,6 +708,11 @@ class QQChannel(BaseChannel):
 
         self._http: Optional[aiohttp.ClientSession] = None
 
+        # Interactive card handler (tool-guard approval cards).
+        from .cards.dispatcher import QQCardHandler
+
+        self._card_handler = QQCardHandler(self)
+
     def _get_access_token_sync(self) -> str:
         """Sync get access_token for WebSocket thread. Instance-level cache."""
         with self._token_lock:
@@ -714,7 +725,7 @@ class QQChannel(BaseChannel):
             import urllib.request
 
             req = urllib.request.Request(
-                TOKEN_URL,
+                _get_token_url(),
                 data=json.dumps(
                     {"appId": self.app_id, "clientSecret": self.client_secret},
                 ).encode(),
@@ -753,7 +764,7 @@ class QQChannel(BaseChannel):
             ):
                 return self._token_cache["token"]
         async with self._http.post(
-            TOKEN_URL,
+            _get_token_url(),
             json={"appId": self.app_id, "clientSecret": self.client_secret},
             headers={"Content-Type": "application/json"},
         ) as resp:
@@ -806,9 +817,8 @@ class QQChannel(BaseChannel):
         process: ProcessHandler,
         config: QQChannelConfig,
         on_reply_sent: OnReplySent = None,
-        show_tool_details: bool = True,
-        filter_tool_messages: bool = False,
-        filter_thinking: bool = False,
+        display_config: ChannelDisplayConfig | None = None,
+        no_text_debounce: bool = True,
         workspace_dir: Path | None = None,
     ) -> "QQChannel":
         return cls(
@@ -819,9 +829,9 @@ class QQChannel(BaseChannel):
             bot_prefix=config.bot_prefix or "",
             markdown_enabled=getattr(config, "markdown_enabled", True),
             on_reply_sent=on_reply_sent,
-            show_tool_details=show_tool_details,
-            filter_tool_messages=filter_tool_messages,
-            filter_thinking=filter_thinking,
+            display_config=display_config
+            or ChannelDisplayConfig.from_config(config),
+            no_text_debounce=no_text_debounce,
             media_dir=getattr(config, "media_dir", ""),
             workspace_dir=workspace_dir,
             max_reconnect_attempts=getattr(
@@ -830,6 +840,12 @@ class QQChannel(BaseChannel):
                 100,
             ),
             ack_message=getattr(config, "ack_message", ""),
+            access_control_dm=bool(
+                getattr(config, "access_control_dm", False),
+            ),
+            access_control_group=bool(
+                getattr(config, "access_control_group", False),
+            ),
         )
 
     def _resolve_send_path(
@@ -841,29 +857,122 @@ class QQChannel(BaseChannel):
         guild_id: Optional[str] = None,
     ) -> tuple[str, bool, str]:
         """Return (api_path, use_msg_seq, seq_key)."""
-        if message_type == "dm" and guild_id:
+        if message_type == "dm":
+            if not guild_id:
+                raise ValueError("QQ guild DM route requires guild_id")
             return (
                 f"/dms/{guild_id}/messages",
                 False,
                 "",
             )
-        if message_type == "group" and group_openid:
+        if message_type == "group":
+            if not group_openid:
+                raise ValueError("QQ group route requires group_openid")
             return (
                 f"/v2/groups/{group_openid}/messages",
                 True,
                 "group",
             )
-        if message_type == "guild" and channel_id:
+        if message_type == "guild":
+            if not channel_id:
+                raise ValueError("QQ guild route requires channel_id")
             return (
                 f"/channels/{channel_id}/messages",
                 False,
                 "",
             )
-        # c2c or fallback
+        if message_type == "c2c":
+            if not sender_id:
+                raise ValueError("QQ C2C route requires user_openid")
+            return (
+                f"/v2/users/{sender_id}/messages",
+                True,
+                "c2c",
+            )
+        raise ValueError(f"Unsupported QQ message_type: {message_type}")
+
+    # ------------------------------------------------------------------
+    # Session / route helpers
+    # ------------------------------------------------------------------
+
+    def resolve_session_id(
+        self,
+        sender_id: str,
+        channel_meta: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Return a session ID scoped to one QQ conversation."""
+        meta = channel_meta or {}
+        message_type = str(meta.get("message_type") or "c2c")
+        if message_type == "group":
+            group_openid = str(meta.get("group_openid") or "unknown")
+            return f"qq:group:{group_openid}"
+        if message_type == "guild":
+            channel_id = str(meta.get("channel_id") or "unknown")
+            return f"qq:guild:{channel_id}"
+        if message_type == "dm":
+            guild_id = str(meta.get("guild_id") or "unknown")
+            return f"qq:dm:{guild_id}"
+        return f"qq:c2c:{sender_id or 'unknown'}"
+
+    @staticmethod
+    def _route_meta_from_handle(to_handle: str) -> Dict[str, str]:
+        """Decode a QQ session ID or direct handle into routing metadata."""
+        handle = (to_handle or "").strip()
+        routes = (
+            ("qq:c2c:", "c2c", "sender_id"),
+            ("qq:group:", "group", "group_openid"),
+            ("qq:guild:", "guild", "channel_id"),
+            ("qq:dm:", "dm", "guild_id"),
+            ("qq:", "c2c", "sender_id"),
+            ("group:", "group", "group_openid"),
+            ("channel:", "guild", "channel_id"),
+        )
+        for prefix, message_type, target_key in routes:
+            if handle.startswith(prefix):
+                target = handle.removeprefix(prefix)
+                if target == "unknown":
+                    return {"message_type": message_type}
+                return {
+                    "message_type": message_type,
+                    target_key: target,
+                }
+        return {}
+
+    def _normalize_route_meta(
+        self,
+        to_handle: str,
+        meta: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Merge durable route data encoded in ``to_handle`` into metadata."""
+        route_meta = dict(meta or {})
+        encoded_route = self._route_meta_from_handle(to_handle)
+        if encoded_route:
+            route_meta.update(encoded_route)
+        else:
+            route_meta.setdefault("message_type", "c2c")
+            if to_handle:
+                route_meta.setdefault("sender_id", to_handle)
+        return route_meta
+
+    def to_handle_from_target(self, *, user_id: str, session_id: str) -> str:
+        """Return a durable QQ session handle for proactive sends."""
+        return session_id or f"qq:c2c:{user_id}"
+
+    def get_to_handle_from_request(self, request: Any) -> str:
+        """Return the request session ID so replies retain their route."""
+        session_id = getattr(request, "session_id", "") or ""
+        user_id = getattr(request, "user_id", "") or ""
+        return session_id or f"qq:c2c:{user_id}"
+
+    def get_on_reply_sent_args(
+        self,
+        request: Any,
+        to_handle: str,
+    ) -> tuple:
+        """Report the original QQ user and isolated session to the callback."""
         return (
-            f"/v2/users/{sender_id}/messages",
-            True,
-            "c2c",
+            getattr(request, "user_id", "") or "",
+            getattr(request, "session_id", "") or "",
         )
 
     async def _dispatch_text(
@@ -1077,12 +1186,12 @@ class QQChannel(BaseChannel):
         meta: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Send one text via QQ HTTP API.
-        Routes by meta or to_handle (group:/channel:/openid).
+        Routes by metadata or a conversation-scoped QQ session handle.
         """
         if not self.enabled or not text.strip():
             return
         text = text.strip()
-        meta = meta or {}
+        meta = self._normalize_route_meta(to_handle, meta)
         use_markdown = _as_bool(
             meta.get("markdown_enabled", self._markdown_enabled),
         )
@@ -1092,21 +1201,12 @@ class QQChannel(BaseChannel):
                 logger.info(
                     "qq send: stripped URL content for API compatibility",
                 )
-        message_type = meta.get("message_type")
+        message_type = str(meta.get("message_type") or "c2c")
         msg_id = meta.get("message_id")
         sender_id = meta.get("sender_id") or to_handle
         channel_id = meta.get("channel_id")
         group_openid = meta.get("group_openid")
         guild_id = meta.get("guild_id")
-        if message_type is None:
-            if to_handle.startswith("group:"):
-                message_type = "group"
-                group_openid = to_handle[6:]
-            elif to_handle.startswith("channel:"):
-                message_type = "guild"
-                channel_id = to_handle[8:]
-            else:
-                message_type = "c2c"
         try:
             token = await self._get_access_token_async()
         except Exception:
@@ -1310,14 +1410,19 @@ class QQChannel(BaseChannel):
         if attachments:
             media_parts = self._parse_qq_attachments(attachments)
             content_parts = list(content_parts) + media_parts
-        session_id = self.resolve_session_id(sender_id, meta)
-        return self.build_agent_request_from_user_content(
+        session_id = payload.get("session_id") or self.resolve_session_id(
+            sender_id,
+            meta,
+        )
+        request = self.build_agent_request_from_user_content(
             channel_id=channel_id,
             sender_id=sender_id,
             session_id=session_id,
             content_parts=content_parts,
             channel_meta=meta,
         )
+        request.channel_meta = meta
+        return request
 
     # ------------------------------------------------------------------
     # Instant acknowledgment
@@ -1463,12 +1568,16 @@ class QQChannel(BaseChannel):
                 break
         if not sender:
             return
+
         msg_id = d.get("id", "")
         att = d.get("attachments") or []
+        is_group = spec.message_type in ("group", "guild")
         meta: Dict[str, Any] = {
             "message_type": spec.message_type,
             "message_id": msg_id,
             "sender_id": sender,
+            "user_name": author.get("username", ""),
+            "is_group": is_group,
             "incoming_raw": d,
             "attachments": att,
         }
@@ -1538,6 +1647,36 @@ class QQChannel(BaseChannel):
         )
 
     # ------------------------------------------------------------------
+    # Interactive cards (tool-guard approval)
+    # ------------------------------------------------------------------
+
+    def _handle_interaction_event(self, d: Dict[str, Any]) -> None:
+        """Handle an INTERACTION_CREATE WebSocket event."""
+        self._card_handler.handle_interaction_event(d)
+
+    async def on_event_message_completed(
+        self,
+        request: Any,
+        to_handle: str,
+        event: Any,
+        send_meta: Dict[str, Any],
+    ) -> None:
+        """Render card-flagged events via the card handler; else default."""
+        send_meta = self._normalize_route_meta(to_handle, send_meta)
+        if await self._card_handler.try_send_card_for_event(
+            to_handle,
+            event,
+            send_meta,
+        ):
+            return
+        await super().on_event_message_completed(
+            request,
+            to_handle,
+            event,
+            send_meta,
+        )
+
+    # ------------------------------------------------------------------
     # WebSocket: payload dispatch
     # ------------------------------------------------------------------
 
@@ -1578,6 +1717,7 @@ class QQChannel(BaseChannel):
                 )
             else:
                 intents = INTENT_PUBLIC_GUILD_MESSAGES | INTENT_GUILD_MEMBERS
+                intents |= INTENT_INTERACTION
                 if state.identify_fail_count < 3:
                     intents |= INTENT_DIRECT_MESSAGE | INTENT_GROUP_AND_C2C
                 ws.send(
@@ -1607,6 +1747,8 @@ class QQChannel(BaseChannel):
                 state.reconnect_attempts = 0
                 state.last_connect_time = time.time()
                 logger.info("qq session resumed")
+            elif t == "INTERACTION_CREATE":
+                self._handle_interaction_event(d or {})
             elif t in _MESSAGE_EVENT_SPECS:
                 self._handle_msg_event(t, d or {})
             return None
@@ -1660,6 +1802,29 @@ class QQChannel(BaseChannel):
             min(state.reconnect_attempts, len(RECONNECT_DELAYS) - 1)
         ]
 
+    def _wait_and_check_reconnect(self, state: _WSState) -> bool:
+        """Apply backoff delay for connection-setup failures.
+
+        Increments reconnect_attempts, respects max_reconnect_attempts,
+        and waits with exponential backoff.
+        Returns True to continue reconnecting, False to stop.
+        """
+        delay = RECONNECT_DELAYS[
+            min(state.reconnect_attempts, len(RECONNECT_DELAYS) - 1)
+        ]
+        state.reconnect_attempts += 1
+        max_attempts = self._max_reconnect_attempts
+        if max_attempts != -1 and state.reconnect_attempts >= max_attempts:
+            logger.error("qq max reconnect attempts reached")
+            return False
+        logger.info(
+            "qq reconnecting in %ss (attempt %s)",
+            delay,
+            state.reconnect_attempts,
+        )
+        self._stop_event.wait(timeout=delay)
+        return not self._stop_event.is_set()
+
     # ------------------------------------------------------------------
     # WebSocket: single connection attempt
     # ------------------------------------------------------------------
@@ -1683,13 +1848,13 @@ class QQChannel(BaseChannel):
             url = _get_channel_url_sync(token)
         except Exception as e:
             logger.warning("qq get token/gateway failed: %s", e)
-            return True
+            return self._wait_and_check_reconnect(state)
         logger.info("qq connecting to %s", url)
         try:
             ws = websocket.create_connection(url)
         except Exception as e:
             logger.warning("qq ws connect failed: %s", e)
-            return True
+            return self._wait_and_check_reconnect(state)
 
         self._ws = ws
         hb = _HeartbeatController(ws, self._stop_event, state)
@@ -1966,7 +2131,7 @@ class QQChannel(BaseChannel):
 
         body = "\n".join(text_parts).strip() if text_parts else ""
 
-        meta = meta or {}
+        meta = self._normalize_route_meta(to_handle, meta)
         message_type = meta.get("message_type", "c2c")
         msg_id = meta.get("message_id")
 
@@ -2030,7 +2195,7 @@ class QQChannel(BaseChannel):
         if not self.enabled:
             return
 
-        meta = meta or {}
+        meta = self._normalize_route_meta(to_handle, meta)
         (
             message_type,
             sender_id,

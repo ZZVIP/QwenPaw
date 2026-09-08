@@ -7,9 +7,75 @@ import os
 import click
 import uvicorn
 
-from ..constant import LOG_LEVEL_ENV
+from ..app.auth import is_auth_enabled
+from ..browser.control_link.chrome.protocol import NM_MAX_INBOUND_BYTES
 from ..config.utils import write_last_api
-from ..utils.logging import setup_logger, SuppressPathAccessLogFilter
+from ..constant import LOG_LEVEL_ENV
+from ..utils.http import is_loopback_host, probe_host_for_bind_host
+from ..utils.logging import SuppressPathAccessLogFilter, setup_logger
+from ..utils.platform import warn_unelevated_sandbox
+
+logger = logging.getLogger(__name__)
+
+
+def _format_bind_address(host: str, port: int) -> str:
+    """Return a readable bind address for startup logs."""
+    normalized_host = host.strip()
+    if ":" in normalized_host and not normalized_host.startswith("["):
+        normalized_host = f"[{normalized_host}]"
+    return f"{normalized_host}:{port}"
+
+
+def _warn_if_auth_off_non_loopback_bind(host: str, port: int) -> None:
+    """Warn when QwenPaw is reachable beyond loopback without auth."""
+    if is_auth_enabled() or is_loopback_host(host):
+        return
+
+    bind_address = _format_bind_address(host, port)
+    warning = f"""
+============================================================
+SECURITY NOTICE: QwenPaw is bound to {bind_address} without authentication.
+
+Anyone who can reach this address may access QwenPaw APIs without login.
+
+Recommended:
+  - Restrict access to a trusted network interface or protected environment.
+  - Enable authentication with QWENPAW_AUTH_ENABLED=true if untrusted users or
+    processes may reach this address.
+============================================================
+""".strip()
+    if logger.isEnabledFor(logging.WARNING):
+        logger.warning("\n%s", warning)
+    else:
+        click.echo(warning, err=True)
+
+
+def configure_server_process(
+    host: str,
+    port: int,
+    log_level: str,
+    hide_access_paths: tuple[str, ...],
+    *,
+    reload: bool = False,
+) -> None:
+    """Configure shared process state for an HTTP server command."""
+    write_last_api(probe_host_for_bind_host(host), port)
+    os.environ[LOG_LEVEL_ENV] = log_level
+    if reload:
+        os.environ["QWENPAW_RELOAD_MODE"] = "1"
+
+    setup_logger(log_level)
+    if log_level in ("debug", "trace"):
+        from .main import log_init_timings
+
+        log_init_timings()
+
+    paths = [path for path in hide_access_paths if path]
+    if paths:
+        logging.getLogger("uvicorn.access").addFilter(
+            SuppressPathAccessLogFilter(paths),
+        )
+    warn_unelevated_sandbox()
 
 
 @click.command("app")
@@ -40,7 +106,7 @@ from ..utils.logging import setup_logger, SuppressPathAccessLogFilter
 @click.option(
     "--hide-access-paths",
     multiple=True,
-    default=("/console/push-messages",),
+    default=("/console/push-messages", "/console/inbox/events"),
     show_default=True,
     help="Path substrings to hide from uvicorn access log (repeatable).",
 )
@@ -61,7 +127,14 @@ def app_cmd(
     hide_access_paths: tuple[str, ...],
 ) -> None:
     """Run QwenPaw FastAPI app."""
-    # Handle deprecated --workers parameter
+    # NOTE: the server intentionally runs UNPRIVILEGED. The Windows
+    # restricted-token sandbox no longer requires the whole server to be
+    # elevated (which PR #5931 forced via ShellExecuteW("runas"), breaking
+    # headless / VBS launchers with a surprise UAC prompt and a detached,
+    # un-closable window). If sandbox is enabled but the process is not
+    # admin, warn_unelevated_sandbox() below will log a warning about
+    # reduced isolation before the server starts.
+
     if workers is not None:
         click.echo(
             "⚠️  WARNING: --workers option is deprecated and will be removed "
@@ -75,31 +148,14 @@ def app_cmd(
         )
         click.echo(err=True)
 
-    # Persist last used host/port for other terminals
-    if host == "0.0.0.0":
-        write_last_api("127.0.0.1", port)
-    else:
-        write_last_api(host, port)
-    os.environ[LOG_LEVEL_ENV] = log_level
-
-    # Signal reload mode to browser_control.py for Windows
-    # compatibility: use sync Playwright + ThreadPool only when reload=True
-    if reload:
-        os.environ["QWENPAW_RELOAD_MODE"] = "1"
-    else:
-        os.environ.pop("QWENPAW_RELOAD_MODE", None)
-
-    setup_logger(log_level)
-    if log_level in ("debug", "trace"):
-        from .main import log_init_timings
-
-        log_init_timings()
-
-    paths = [p for p in hide_access_paths if p]
-    if paths:
-        logging.getLogger("uvicorn.access").addFilter(
-            SuppressPathAccessLogFilter(paths),
-        )
+    configure_server_process(
+        host,
+        port,
+        log_level,
+        hide_access_paths,
+        reload=reload,
+    )
+    _warn_if_auth_off_non_loopback_bind(host, port)
 
     uvicorn.run(
         "qwenpaw.app._app:app",
@@ -108,4 +164,9 @@ def app_cmd(
         reload=reload,
         workers=1,
         log_level=log_level,
+        # Bound shutdown so workspace SSE connections cannot block exit.
+        timeout_graceful_shutdown=5,
+        # Chrome Native Messaging inbound limit; this server-wide value is a
+        # protocol fact rather than a user-configurable WebSocket capacity.
+        ws_max_size=NM_MAX_INBOUND_BYTES,
     )

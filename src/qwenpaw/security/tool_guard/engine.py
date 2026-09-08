@@ -18,13 +18,18 @@ Custom guardians can be registered at construction time or later via
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Any
 
 from ...constant import EnvVarLoader
+from ...utils.shell_normalization import normalize_posix_line_continuations
 from .guardians import BaseToolGuardian
 from .guardians.file_guardian import FilePathToolGuardian
-from .guardians.rule_guardian import RuleBasedToolGuardian
+from .guardians.rule_guardian import (
+    RuleBasedToolGuardian,
+    SharedSafetyToolGuardian,
+)
 from .guardians.shell_evasion_guardian import ShellEvasionGuardian
 from .models import ToolGuardResult
 
@@ -87,6 +92,14 @@ class ToolGuardEngine:
         """Return the default set of guardians."""
         guardians: list[BaseToolGuardian] = []
         try:
+            # Always-on shared catastrophic / system-power checks first.
+            guardians.append(SharedSafetyToolGuardian())
+        except Exception as exc:  # pragma: no cover
+            logger.warning(
+                "Failed to initialise SharedSafetyToolGuardian: %s",
+                exc,
+            )
+        try:
             guardians.append(FilePathToolGuardian())
         except Exception as exc:  # pragma: no cover
             logger.warning(
@@ -146,12 +159,22 @@ class ToolGuardEngine:
         """Tools unconditionally denied (no approval offered)."""
         return self._denied_tools
 
+    @property
+    def auto_denied_rules(self) -> set[str]:
+        """Rule IDs that unconditionally deny matched tool calls."""
+        return self._auto_denied_rules
+
     def _reload_tool_sets(self) -> None:
-        """Refresh guarded and denied tool sets from config."""
-        from .utils import resolve_denied_tools, resolve_guarded_tools
+        """Refresh guarded/denied tool and rule sets from config."""
+        from .utils import (
+            resolve_auto_denied_rules,
+            resolve_denied_tools,
+            resolve_guarded_tools,
+        )
 
         self._guarded_tools: set[str] | None = resolve_guarded_tools()
         self._denied_tools: set[str] = resolve_denied_tools()
+        self._auto_denied_rules: set[str] = resolve_auto_denied_rules()
 
     def reload_rules(self) -> None:
         """Reload guardian rules and refresh guarded/denied tool sets."""
@@ -163,6 +186,19 @@ class ToolGuardEngine:
     def is_denied(self, tool_name: str) -> bool:
         """``True`` when *tool_name* is unconditionally denied."""
         return tool_name in self._denied_tools
+
+    def should_auto_deny_result(self, result: ToolGuardResult | None) -> bool:
+        """``True`` when guard findings hit any configured auto-deny rule."""
+        if (
+            result is None
+            or not result.findings
+            or not self._auto_denied_rules
+        ):
+            return False
+        return any(
+            finding.rule_id in self._auto_denied_rules
+            for finding in result.findings
+        )
 
     def is_guarded(self, tool_name: str) -> bool:
         """``True`` when *tool_name* falls within the guard scope."""
@@ -208,6 +244,19 @@ class ToolGuardEngine:
             params=params,
         )
 
+        # POSIX removes backslash-newline continuations before tokenization.
+        # Give every guardian that same effective command so path and regex
+        # checks cannot be bypassed by splitting a sensitive token across
+        # physical lines.  Keep result.params unchanged for faithful logging.
+        guardian_params = params
+        if tool_name == "execute_shell_command" and os.name != "nt":
+            command = params.get("command")
+            if isinstance(command, str):
+                normalized = normalize_posix_line_continuations(command)
+                if normalized != command:
+                    guardian_params = dict(params)
+                    guardian_params["command"] = normalized
+
         guardians = (
             [g for g in self._guardians if g.always_run]
             if only_always_run
@@ -216,7 +265,7 @@ class ToolGuardEngine:
 
         for guardian in guardians:
             try:
-                findings = guardian.guard(tool_name, params)
+                findings = guardian.guard(tool_name, guardian_params)
                 result.findings.extend(findings)
                 result.guardians_used.append(guardian.name)
             except Exception as exc:

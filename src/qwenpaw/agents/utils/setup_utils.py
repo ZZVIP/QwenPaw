@@ -9,6 +9,7 @@ import shutil
 from pathlib import Path
 
 from ...constant import SUPPORTED_AGENT_LANGUAGES
+from ...utils.logging import sanitize_log_value
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,71 @@ def normalize_agent_language(language: str) -> str:
     return "en"
 
 
+def ensure_workspace_md_file(
+    workspace_dir: Path | str,
+    language: str,
+    filename: str,
+) -> None:
+    """Copy a single md_files template into the workspace if missing.
+
+    Idempotent: never overwrites an existing file.  Reuses the
+    md_files language layout (falling back to English) so the file
+    matches the agent language.  Failures are logged and never raised.
+    """
+    try:
+        if filename == "CONTACTS.md":
+            safe_filename = "CONTACTS.md"
+        elif filename == "MAIL_TRIAGE.md":
+            safe_filename = "MAIL_TRIAGE.md"
+        else:
+            log_filename = str(filename).replace("\r", "").replace("\n", "")
+            logger.warning(
+                "Unsupported workspace md template: %s",
+                log_filename,
+            )
+            return
+        workspace_dir = Path(workspace_dir).expanduser()
+        target = workspace_dir / safe_filename
+        if target.exists():
+            return
+        md_files_root = (
+            Path(__file__).resolve().parent.parent / "md_files"
+        ).resolve()
+        language = normalize_agent_language(language or "en")
+        log_language = language.replace("\r", "").replace("\n", "")
+        source_dir = md_files_root / "en"
+        if md_files_root.is_dir():
+            for candidate in md_files_root.iterdir():
+                if candidate.is_dir() and candidate.name == language:
+                    source_dir = candidate
+                    break
+        source = source_dir / safe_filename
+        if not source.is_file():
+            source = md_files_root / "en" / safe_filename
+        if not source.is_file():
+            logger.warning(
+                "%s template not found for language %s",
+                safe_filename,
+                log_language,
+            )
+            return
+        workspace_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        logger.debug(
+            "Copied %s [%s] to %s",
+            safe_filename,
+            log_language,
+            sanitize_log_value(target),
+        )
+    except Exception as e:
+        logger.warning(
+            "Failed to ensure %s for %s: %s",
+            sanitize_log_value(filename),
+            sanitize_log_value(workspace_dir),
+            sanitize_log_value(e),
+        )
+
+
 def copy_md_files(
     language: str,
     skip_existing: bool = False,
@@ -36,7 +102,7 @@ def copy_md_files(
     """Copy md files from agents/md_files to working directory.
 
     Args:
-        language: Language code (e.g. 'en', 'zh')
+        language: Supported agent language code.
         skip_existing: If True, skip files that already exist in working dir.
         workspace_dir: Target workspace directory. If None, uses WORKING_DIR.
         exclude_filenames: File names to skip while copying.
@@ -190,11 +256,12 @@ def copy_template_md_files(
     """Copy template-specific markdown files into an agent workspace.
 
     Files are read from ``md_files/<template_id>/<language>/`` with fallback
-    order ``language`` → ``en`` → ``zh`` → ``ru`` on a per-file basis.
+    order ``language`` then the built-in fallback languages on a
+    per-file basis.
 
     Args:
         template_id: Template directory name under ``agents/md_files``.
-        language: Language code (en/zh/ru).
+        language: Supported agent language code.
         workspace_dir: Agent workspace root.
         only_if_missing: If True, skip targets that already exist.
 

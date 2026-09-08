@@ -22,7 +22,10 @@ from ..config.config import (
     generate_short_agent_id,
     save_agent_config,
 )
-from ..constant import WORKING_DIR
+from ..constant import (
+    DEFAULT_STREAM_TASK_TIMEOUT_SECONDS,
+    WORKING_DIR,
+)
 from ..config.config import ModelSlotConfig
 from ..providers.provider_manager import ProviderManager
 from .http import print_json, resolve_base_url
@@ -108,6 +111,7 @@ def _submit_background_task(
     to_agent: str,
     session_id: str,
     timeout: int,
+    task_timeout: Optional[float] = None,
 ) -> None:
     """Submit background task and return task_id."""
     try:
@@ -116,7 +120,13 @@ def _submit_background_task(
             request_payload,
             to_agent,
             timeout,
+            task_timeout=task_timeout,
         )
+
+        error = result.get("error")
+        if error:
+            click.echo(f"ERROR: {error}", err=True)
+            return
 
         task_id = result.get("task_id")
         if not task_id:
@@ -781,6 +791,17 @@ def delete_cmd(
     help="Request timeout in seconds (default 300)",
 )
 @click.option(
+    "--task-timeout",
+    type=float,
+    default=None,
+    help=(
+        "Task execution timeout in seconds for background tasks. "
+        "Overrides the server-side default "
+        f"({DEFAULT_STREAM_TASK_TIMEOUT_SECONDS}s). "
+        "Must be a positive number when set."
+    ),
+)
+@click.option(
     "--json-output",
     is_flag=True,
     default=False,
@@ -802,12 +823,13 @@ def chat_cmd(
     background: bool,
     task_id: Optional[str],
     timeout: int,
+    task_timeout: Optional[float],
     json_output: bool,
     base_url: Optional[str],
 ) -> None:
     """Chat with another agent (inter-agent communication).
 
-    Sends a message to another agent via /api/agent/process endpoint
+    Sends a message to another agent via /api/console/chat endpoint
     and returns the response. By default generates unique session IDs
     to avoid concurrency issues.
 
@@ -936,6 +958,7 @@ def chat_cmd(
             to_agent,
             final_session_id,
             timeout,
+            task_timeout=task_timeout,
         )
         return
 

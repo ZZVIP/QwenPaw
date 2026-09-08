@@ -4,17 +4,17 @@ import {
   AppstoreOutlined,
   CloseOutlined,
   DeleteOutlined,
-  ImportOutlined,
-  PlusOutlined,
   ReloadOutlined,
   SendOutlined,
   SyncOutlined,
   UnorderedListOutlined,
-  UploadOutlined,
 } from "@ant-design/icons";
+import { useCallback } from "react";
 import { useTranslation } from "react-i18next";
+import { useNavigate } from "react-router-dom";
 import { ImportHubModal } from "../../Agent/Skills/components/ImportHubModal";
 import { SkillFilterDropdown } from "../../Agent/Skills/components/SkillFilterDropdown";
+import { AddSkillDropdown } from "../../Agent/Skills/components/AddSkillDropdown";
 import {
   BroadcastModal,
   ImportBuiltinModal,
@@ -38,6 +38,12 @@ function SkillPoolPage() {
     hasMore,
     sentinelRef,
   } = useProgressiveRender(pool.sortedSkills);
+
+  const navigate = useNavigate();
+
+  const openMarket = useCallback(() => {
+    navigate("/market?tab=skills&target=pool");
+  }, [navigate]);
 
   return (
     <div className={styles.skillsPage}>
@@ -130,37 +136,15 @@ function SkillPoolPage() {
                   </Tooltip>
                 </div>
                 <div className={styles.headerActionsRight}>
-                  <Tooltip title={t("skillPool.uploadZipHint")}>
-                    <Button
-                      type="default"
-                      icon={<UploadOutlined />}
-                      onClick={() => pool.zipInputRef.current?.click()}
-                    >
-                      {t("skills.uploadZip")}
-                    </Button>
-                  </Tooltip>
-                  <Tooltip title={t("skillPool.importHubHint")}>
-                    <Button
-                      type="default"
-                      icon={<ImportOutlined />}
-                      onClick={() => pool.setImportModalOpen(true)}
-                    >
-                      {t("skills.importHub")}
-                    </Button>
-                  </Tooltip>
                   <Button type="primary" onClick={pool.toggleBatchMode}>
                     {t("skills.batchOperation")}
                   </Button>
-                  <Tooltip title={t("skills.createSkillHint")}>
-                    <Button
-                      type="primary"
-                      className={styles.primaryActionButton}
-                      icon={<PlusOutlined />}
-                      onClick={pool.openCreate}
-                    >
-                      {t("skills.createSkill")}
-                    </Button>
-                  </Tooltip>
+                  <AddSkillDropdown
+                    onCreate={pool.openCreate}
+                    onUploadZip={() => pool.zipInputRef.current?.click()}
+                    onFromUrl={() => pool.setImportModalOpen(true)}
+                    onBrowseMarket={openMarket}
+                  />
                 </div>
               </>
             )}
@@ -188,11 +172,11 @@ function SkillPoolPage() {
                 value={pool.searchTags}
                 onChange={pool.setSearchTags}
                 open={pool.filterOpen}
-                onDropdownVisibleChange={pool.setFilterOpen}
+                onOpenChange={pool.setFilterOpen}
                 allowClear
                 maxTagCount="responsive"
                 notFoundContent={<></>}
-                dropdownRender={() =>
+                popupRender={() =>
                   pool.allTags.length > 0 ? (
                     <SkillFilterDropdown
                       allTags={pool.allTags}
@@ -245,17 +229,19 @@ function SkillPoolPage() {
             </span>
           </div>
         ) : pool.viewMode === "card" ? (
-          <div className={styles.skillsGrid}>
+          <div className={`${styles.skillsGrid} responsive-grid`}>
             {visibleSkills.map((skill: PoolSkillSpec) => (
               <PoolSkillCard
                 key={skill.name}
                 skill={skill}
                 isSelected={pool.selectedPoolSkills.has(skill.name)}
                 batchModeEnabled={pool.batchModeEnabled}
+                automationPending={pool.automationPendingSkills.has(skill.name)}
                 onToggleSelect={pool.togglePoolSelect}
                 onEdit={pool.openEdit}
                 onBroadcast={pool.openBroadcast}
                 onDelete={pool.handleDelete}
+                onAutomationQuickAction={pool.handleAutomationQuickAction}
               />
             ))}
             {hasMore && <div ref={sentinelRef} style={{ height: 1 }} />}
@@ -310,17 +296,27 @@ function SkillPoolPage() {
       <PoolSkillDrawer
         mode={pool.mode}
         activeSkill={pool.activeSkill}
+        loading={pool.detailLoading}
+        saving={pool.saving}
+        skillName={pool.detailSkillName}
         form={pool.form}
         drawerContent={pool.drawerContent}
         showMarkdown={pool.showMarkdown}
         configText={pool.configText}
         availableTags={pool.allTags}
+        workspaces={pool.workspaces}
+        builtinAutoUpdateEnabled={pool.builtinAutoUpdateEnabled}
+        autoSyncEnabled={pool.autoSyncEnabled}
+        autoSyncTargets={pool.autoSyncTargets}
         onClose={pool.closeDrawer}
         onSave={pool.handleSavePoolSkill}
         onContentChange={pool.handleDrawerContentChange}
         onShowMarkdownChange={pool.setShowMarkdown}
         onConfigTextChange={pool.setConfigText}
         onChangeBuiltinLanguage={pool.handleBuiltinLanguageSwitch}
+        onBuiltinAutoUpdateEnabledChange={pool.setBuiltinAutoUpdateEnabled}
+        onAutoSyncEnabledChange={pool.setAutoSyncEnabled}
+        onAutoSyncTargetsChange={pool.setAutoSyncTargets}
         validateFrontmatter={pool.validateFrontmatter}
       />
 

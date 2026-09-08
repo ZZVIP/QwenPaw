@@ -4,6 +4,7 @@ GeminiChatModel."""
 
 from __future__ import annotations
 
+import copy
 import logging
 import time
 from typing import Any, List
@@ -12,6 +13,7 @@ from agentscope.model import ChatModelBase
 from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types as genai_types
+from pydantic import Field
 
 from qwenpaw.providers.multimodal_prober import (
     ProbeResult,
@@ -21,18 +23,178 @@ from qwenpaw.providers.multimodal_prober import (
     _is_media_keyword_error,
     evaluate_image_probe_answer,
 )
-from qwenpaw.providers.provider import ModelInfo, Provider
+from qwenpaw.providers.provider import (
+    ModelConnectionResult,
+    ModelInfo,
+    Provider,
+)
+from ..utils.logging import sanitize_log_value
+from .capping_formatter import _CappingGeminiFormatter
+from .capping_formatter import MAX_INLINE_MEDIA_BYTES
 
 logger = logging.getLogger(__name__)
+
+
+# Keep QwenPaw's schema normalization ahead of AgentScope's formatter so
+# custom OpenAI-compatible Gemini proxies receive the same conservative schema
+# shape as the native Gemini endpoint.
+
+
+def _flatten_json_schema(schema: dict) -> dict:
+    """Flatten a JSON schema by resolving all ``$ref`` references.
+
+    Gemini API does not support ``$defs`` and ``$ref`` in JSON schemas.
+    """
+    schema = copy.deepcopy(schema)
+    defs = schema.pop("$defs", {})
+
+    def _resolve_ref(obj: Any, visited: set | None = None) -> Any:
+        if visited is None:
+            visited = set()
+        if not isinstance(obj, dict):
+            if isinstance(obj, list):
+                return [_resolve_ref(item, visited.copy()) for item in obj]
+            return obj
+        if "$ref" in obj:
+            ref_path = obj["$ref"]
+            if ref_path.startswith("#/$defs/"):
+                def_name = ref_path[len("#/$defs/") :]
+                if def_name in visited:
+                    logger.warning(
+                        "Circular reference detected for '%s' in tool schema",
+                        def_name,
+                    )
+                    return {
+                        "type": "object",
+                        "description": f"(circular: {def_name})",
+                    }
+                visited.add(def_name)
+                if def_name in defs:
+                    resolved = _resolve_ref(defs[def_name], visited.copy())
+                    for key, value in obj.items():
+                        if key != "$ref":
+                            resolved[key] = _resolve_ref(
+                                value,
+                                visited.copy(),
+                            )
+                    return resolved
+            return obj
+        result = {}
+        for key, value in obj.items():
+            result[key] = _resolve_ref(value, visited.copy())
+        return result
+
+    return _resolve_ref(schema)
+
+
+# pylint: disable=too-many-branches
+def _sanitize_schema_for_gemini(schema: Any) -> Any:
+    """Sanitize a JSON schema to be compatible with the Gemini API.
+
+    Removes or rewrites constructs that Gemini does not support:
+
+    - ``$schema``: removed entirely.
+    - ``additionalProperties``: removed entirely.
+    - ``anyOf`` containing ``{"type": "null"}``: simplified to the single
+      non-null type (i.e. ``Optional[X]`` becomes just ``X``).
+    - ``{"type": "null"}`` appearing as a standalone schema: replaced with
+      ``{"type": "object"}`` because the Gemini API (and many third-party
+      proxies) do not accept ``null`` as a functionDeclaration property type.
+    - ``const``: not supported by the Gemini SDK's ``Schema`` pydantic
+      model (raises ``extra_forbidden``); rewritten to an ``enum`` with a
+      single value, which is semantically equivalent and is supported.
+    - All nested sub-schemas are processed recursively.
+    """
+    if not isinstance(schema, dict):
+        if isinstance(schema, list):
+            return [_sanitize_schema_for_gemini(v) for v in schema]
+        return schema
+
+    schema = dict(schema)
+    schema.pop("$schema", None)
+
+    # Replace standalone "type": "null" with "type": "object".
+    # Some MCP servers emit ``{"type": "null"}`` for parameters that
+    # accept ``None``; the Gemini API and many third-party proxies
+    # reject ``null`` as a valid functionDeclaration schema type.
+    if schema.get("type") == "null":
+        schema["type"] = "object"
+
+    schema.pop("additionalProperties", None)
+
+    # JSON Schema ``const`` is not a recognized field on the Gemini SDK's
+    # ``Schema`` pydantic model and triggers an ``extra_forbidden``
+    # validation error. Rewrite it as a single-value ``enum``, which is
+    # semantically equivalent and is supported by Gemini.
+    if "const" in schema:
+        const_value = schema.pop("const")
+        schema.setdefault("enum", [const_value])
+
+    if "anyOf" in schema and isinstance(schema["anyOf"], list):
+        any_of = schema["anyOf"]
+        non_null = [
+            v
+            for v in any_of
+            if not (isinstance(v, dict) and v.get("type") == "null")
+        ]
+        if len(non_null) < len(any_of):
+            if len(non_null) == 1:
+                merged = dict(_sanitize_schema_for_gemini(non_null[0]))
+                for k, v in schema.items():
+                    if k != "anyOf":
+                        merged.setdefault(k, v)
+                return merged
+            elif non_null:
+                schema["anyOf"] = [
+                    _sanitize_schema_for_gemini(v) for v in non_null
+                ]
+            else:
+                del schema["anyOf"]
+
+    for key in ["properties", "patternProperties", "$defs"]:
+        if key in schema and isinstance(schema[key], dict):
+            schema[key] = {
+                k: _sanitize_schema_for_gemini(v)
+                for k, v in schema[key].items()
+            }
+
+    for key in ["items", "not", "if", "then", "else"]:
+        if key in schema:
+            schema[key] = _sanitize_schema_for_gemini(schema[key])
+
+    for key in ["allOf", "oneOf", "anyOf"]:
+        if key in schema and isinstance(schema[key], list):
+            schema[key] = [_sanitize_schema_for_gemini(v) for v in schema[key]]
+
+    return schema
 
 
 class GeminiProvider(Provider):
     """Provider implementation for Google Gemini API."""
 
+    max_inline_media_bytes: int = Field(
+        default=MAX_INLINE_MEDIA_BYTES,
+        ge=0,
+        description=(
+            "Maximum size (in bytes) of a local media file inlined as "
+            "base64 into the model request body. Media above this is "
+            "replaced with a text placeholder to avoid oversized requests "
+            "when large files (e.g. generated videos) persist in "
+            "conversation history. 0 disables capping."
+        ),
+    )
+
+    def _build_default_headers(self) -> dict:
+        return dict(self.custom_headers) if self.custom_headers else {}
+
     def _client(self, timeout: float = 10) -> Any:
+        headers = self._build_default_headers() or None
         return genai.Client(
             api_key=self.api_key,
-            http_options=genai_types.HttpOptions(timeout=int(timeout * 1000)),
+            http_options=genai_types.HttpOptions(
+                timeout=int(timeout * 1000),
+                headers=headers,
+            ),
         )
 
     @staticmethod
@@ -56,7 +218,16 @@ class GeminiProvider(Provider):
             if not display_name or display_name.startswith("models/"):
                 display_name = model_id
 
-            models.append(ModelInfo(id=model_id, name=display_name))
+            metadata: dict[str, int] = {}
+            input_limit = getattr(row, "input_token_limit", None)
+            if isinstance(input_limit, (int, float)) and input_limit >= 1000:
+                metadata["max_input_length_auto_detected"] = int(input_limit)
+            output_limit = getattr(row, "output_token_limit", None)
+            if isinstance(output_limit, (int, float)) and output_limit > 0:
+                metadata["max_output_length"] = int(output_limit)
+            models.append(
+                ModelInfo(id=model_id, name=display_name, **metadata),
+            )
 
         deduped: List[ModelInfo] = []
         seen: set[str] = set()
@@ -69,10 +240,13 @@ class GeminiProvider(Provider):
 
     async def check_connection(self, timeout: float = 10) -> tuple[bool, str]:
         """Check if Google Gemini provider is reachable."""
+        client = None
+        response = None
         try:
             client = self._client(timeout=timeout)
             # Use the async list models endpoint to verify connectivity
-            async for _ in await client.aio.models.list():
+            response = await client.aio.models.list()
+            async for _ in response:
                 break
             return True, ""
         except genai_errors.APIError:
@@ -86,13 +260,20 @@ class GeminiProvider(Provider):
                 False,
                 "Unknown exception when connecting to Google Gemini API.",
             )
+        finally:
+            await self._close_async_resource(response)
+            if client is not None:
+                await self._close_async_resource(client.aio)
 
     async def fetch_models(self, timeout: float = 10) -> List[ModelInfo]:
         """Fetch available models from Gemini API."""
+        client = None
+        response = None
         try:
             client = self._client(timeout=timeout)
             payload = []
-            async for model in await client.aio.models.list():
+            response = await client.aio.models.list()
+            async for model in response:
                 payload.append(model)
             models = self._normalize_models_payload(payload)
             return models
@@ -100,17 +281,26 @@ class GeminiProvider(Provider):
             return []
         except Exception:
             return []
+        finally:
+            await self._close_async_resource(response)
+            if client is not None:
+                await self._close_async_resource(client.aio)
 
     async def check_model_connection(
         self,
         model_id: str,
         timeout: float = 10,
-    ) -> tuple[bool, str]:
+    ) -> ModelConnectionResult:
         """Check if a specific Gemini model is reachable/usable."""
         target = (model_id or "").strip()
         if not target:
-            return False, "Empty model ID"
+            return ModelConnectionResult(
+                success=False,
+                message="Empty model ID",
+            )
 
+        client = None
+        response = None
         try:
             client = self._client(timeout=timeout)
             response = await client.aio.models.generate_content_stream(
@@ -119,26 +309,101 @@ class GeminiProvider(Provider):
             )
             async for _ in response:
                 break
-            return True, ""
-        except genai_errors.APIError:
-            return (
-                False,
-                f"Model '{model_id}' is not reachable or usable",
+            return ModelConnectionResult(success=True)
+        except genai_errors.APIError as exc:
+            status = getattr(exc, "code", None) or getattr(
+                exc,
+                "status_code",
+                None,
             )
-        except Exception:
-            return (
-                False,
-                f"Unknown exception when connecting to model '{model_id}'",
+            return ModelConnectionResult(
+                success=False,
+                message=(
+                    f"Model '{model_id}' is not reachable or usable: "
+                    f"{self.connection_error_message(exc)}"
+                ),
+                http_status=status if isinstance(status, int) else None,
+                error_kind=(
+                    "permission_denied"
+                    if status in (401, 403)
+                    else "model_not_found"
+                    if status == 404
+                    else None
+                ),
             )
+        except Exception as exc:
+            return ModelConnectionResult(
+                success=False,
+                message=(
+                    f"Unknown exception when connecting to model "
+                    f"'{model_id}': {self.connection_error_message(exc)}"
+                ),
+            )
+        finally:
+            await self._close_async_resource(response)
+            if client is not None:
+                await self._close_async_resource(client.aio)
+
+    @staticmethod
+    async def _close_async_resource(resource: Any) -> None:
+        """Close an SDK stream or client without masking its result."""
+        close = getattr(resource, "aclose", None)
+        if close is None:
+            return
+        try:
+            await close()
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            logger.debug("Failed to close Gemini SDK resource: %s", exc)
+
+    @staticmethod
+    def _adapt_generate_kwargs_for_gemini(
+        kwargs: dict,
+    ) -> dict:
+        """Translate OpenAI-style keys to Gemini's GenerateContentConfig
+        schema.
+
+        google-genai's GenerateContentConfig forbids extra fields, so
+        ``max_tokens`` must be renamed to ``max_output_tokens``.  If both are
+        present, the explicit ``max_output_tokens`` wins.
+        """
+        adapted = dict(kwargs)
+        max_tokens = adapted.pop("max_tokens", None)
+        if max_tokens is not None and "max_output_tokens" not in adapted:
+            adapted["max_output_tokens"] = max_tokens
+        return adapted
 
     def get_chat_model_instance(self, model_id: str) -> ChatModelBase:
+        from agentscope.credential import GeminiCredential
         from agentscope.model import GeminiChatModel
 
-        return GeminiChatModel(
-            model_name=model_id,
-            stream=True,
+        credential = GeminiCredential(
+            id=f"qwenpaw-{self.id}",
             api_key=self.api_key,
-            generate_kwargs=self.get_effective_generate_kwargs(model_id),
+        )
+
+        gen_kwargs = self._adapt_generate_kwargs_for_gemini(
+            self.get_effective_generate_kwargs(model_id),
+        )
+        parameters = GeminiChatModel.Parameters(
+            max_tokens=gen_kwargs.pop("max_output_tokens", None),
+            temperature=gen_kwargs.pop("temperature", None),
+            top_p=gen_kwargs.pop("top_p", None),
+        )
+
+        headers = self._build_default_headers()
+
+        return _GeminiChatModelCompat(
+            credential=credential,
+            model=model_id,
+            parameters=parameters,
+            stream=True,
+            default_headers=headers or None,
+            extra_config_kwargs=gen_kwargs or None,
+            context_size=self._get_context_size(model_id),
+            formatter=_CappingGeminiFormatter(
+                max_bytes=self.max_inline_media_bytes,
+                relay_reasoning_content=self._get_relay_reasoning(model_id),
+            ),
         )
 
     async def probe_model_multimodal(
@@ -179,9 +444,10 @@ class GeminiProvider(Provider):
         """
         import base64
 
+        log_model = sanitize_log_value(model_id)
         logger.info(
             "Image probe start: model=%s url=%s",
-            model_id,
+            log_model,
             self.base_url,
         )
         start_time = time.monotonic()
@@ -213,9 +479,9 @@ class GeminiProvider(Provider):
             elapsed = time.monotonic() - start_time
             logger.warning(
                 "Image probe error: model=%s type=%s msg=%s %.2fs",
-                model_id,
+                log_model,
                 type(e).__name__,
-                e,
+                sanitize_log_value(e),
                 elapsed,
             )
             status = getattr(e, "code", None)
@@ -226,9 +492,9 @@ class GeminiProvider(Provider):
             elapsed = time.monotonic() - start_time
             logger.warning(
                 "Image probe error: model=%s type=%s msg=%s %.2fs",
-                model_id,
+                log_model,
                 type(e).__name__,
-                e,
+                sanitize_log_value(e),
                 elapsed,
             )
             return False, f"Probe failed: {e}"
@@ -242,9 +508,10 @@ class GeminiProvider(Provider):
 
         Asks the model whether the video contains moving content.
         """
+        log_model = sanitize_log_value(model_id)
         logger.info(
             "Video probe start: model=%s url=%s",
-            model_id,
+            log_model,
             self.base_url,
         )
         start_time = time.monotonic()
@@ -276,7 +543,7 @@ class GeminiProvider(Provider):
                 elapsed = time.monotonic() - start_time
                 logger.info(
                     "Video probe done: model=%s result=%s %.2fs",
-                    model_id,
+                    log_model,
                     result[0],
                     elapsed,
                 )
@@ -288,7 +555,7 @@ class GeminiProvider(Provider):
             elapsed = time.monotonic() - start_time
             logger.info(
                 "Video probe done: model=%s result=%s %.2fs",
-                model_id,
+                log_model,
                 result[0],
                 elapsed,
             )
@@ -297,9 +564,9 @@ class GeminiProvider(Provider):
             elapsed = time.monotonic() - start_time
             logger.warning(
                 "Video probe error: model=%s type=%s msg=%s %.2fs",
-                model_id,
+                log_model,
                 type(e).__name__,
-                e,
+                sanitize_log_value(e),
                 elapsed,
             )
             status = getattr(e, "code", None)
@@ -310,9 +577,122 @@ class GeminiProvider(Provider):
             elapsed = time.monotonic() - start_time
             logger.warning(
                 "Video probe error: model=%s type=%s msg=%s %.2fs",
-                model_id,
+                log_model,
                 type(e).__name__,
-                e,
+                sanitize_log_value(e),
                 elapsed,
             )
             return False, f"Probe failed: {e}"
+
+
+class _GeminiChatModelCompat:
+    """Factory that creates a ``GeminiChatModel`` subclass with custom headers
+    and extra config kwargs injected into every API call."""
+
+    def __new__(cls, **kwargs: Any) -> Any:
+        from agentscope.model import GeminiChatModel
+
+        default_headers = kwargs.pop("default_headers", None)
+        extra_config_kwargs = kwargs.pop("extra_config_kwargs", None) or {}
+        if default_headers:
+            client_kwargs = dict(kwargs.get("client_kwargs") or {})
+            client_kwargs["http_options"] = genai_types.HttpOptions(
+                headers=default_headers,
+            )
+            kwargs["client_kwargs"] = client_kwargs
+
+        class _Compat(GeminiChatModel):
+            _qp_extra_config_kwargs = extra_config_kwargs
+
+            # Apply QwenPaw's proxy-compatible normalization before the
+            # AgentScope 2.0.6 formatter performs its native sanitization.
+            def _format_tools(self, tools, tool_choice):
+                if tools:
+                    sanitized = []
+                    for schema in tools:
+                        if "function" not in schema:
+                            sanitized.append(schema)
+                            continue
+                        func = schema["function"].copy()
+                        if "parameters" in func:
+                            func["parameters"] = _sanitize_schema_for_gemini(
+                                _flatten_json_schema(func["parameters"]),
+                            )
+                        sanitized.append({**schema, "function": func})
+                    tools = sanitized
+                return super()._format_tools(tools, tool_choice)
+
+            async def _call_api(
+                self,
+                model_name,
+                messages,
+                tools=None,
+                tool_choice=None,
+                **config_kwargs,
+            ):
+                disable_thinking = bool(
+                    config_kwargs.pop("disable_thinking", False),
+                )
+                config_kwargs = (
+                    # pylint: disable-next=protected-access
+                    GeminiProvider._adapt_generate_kwargs_for_gemini(
+                        config_kwargs,
+                    )
+                )
+                merged = {**self._qp_extra_config_kwargs, **config_kwargs}
+                effective_thinking_enable = (
+                    False
+                    if disable_thinking
+                    else bool(
+                        self.parameters.thinking_enable,
+                    )
+                )
+                from datetime import datetime
+
+                formatted = await self.formatter.format(messages)
+                config: dict[str, Any] = {**merged}
+                if self.parameters.max_tokens is not None:
+                    config.setdefault(
+                        "max_output_tokens",
+                        self.parameters.max_tokens,
+                    )
+                if self.parameters.temperature is not None:
+                    config["temperature"] = self.parameters.temperature
+                if self.parameters.top_p is not None:
+                    config["top_p"] = self.parameters.top_p
+                config["thinking_config"] = {
+                    "include_thoughts": effective_thinking_enable,
+                    "thinking_budget": (
+                        self.parameters.thinking_budget or 1024
+                        if effective_thinking_enable
+                        else 0
+                    ),
+                }
+
+                fmt_tools, fmt_tc = self._format_tools(tools, tool_choice)
+                if fmt_tools is not None:
+                    config["tools"] = fmt_tools
+                if fmt_tc is not None:
+                    config["tool_config"] = fmt_tc
+
+                call_kwargs = {
+                    "model": model_name,
+                    "contents": formatted,
+                    "config": config,
+                }
+                start = datetime.now()
+                if self.stream:
+                    stream_method = (
+                        self.client.aio.models.generate_content_stream
+                    )
+                    response = await stream_method(**call_kwargs)
+                    return self._parse_stream_response(
+                        start,
+                        response,
+                    )
+                response = await self.client.aio.models.generate_content(
+                    **call_kwargs,
+                )
+                return self._parse_completion_response(start, response)
+
+        return _Compat(**kwargs)

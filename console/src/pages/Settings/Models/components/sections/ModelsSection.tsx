@@ -1,6 +1,6 @@
-import { useState, useEffect, useMemo } from "react";
+import React, { useState, useEffect, useMemo } from "react";
 import { SaveOutlined } from "@ant-design/icons";
-import { Select, Button, Card } from "@agentscope-ai/design";
+import { Select, Button } from "@agentscope-ai/design";
 import type { ModelSlotRequest } from "../../../../../api/types";
 import api from "../../../../../api";
 import { useTranslation } from "react-i18next";
@@ -21,15 +21,15 @@ interface ModelsSectionProps {
     require_api_key?: boolean;
   }>;
   activeModels: {
-    active_llm?: {
+    active_llm: {
       provider_id?: string;
       model?: string;
-    };
+    } | null;
   } | null;
   onSaved: () => void;
 }
 
-export function ModelsSection({
+export const ModelsSection = React.memo(function ModelsSection({
   providers,
   activeModels,
   onSaved,
@@ -133,7 +133,8 @@ export function ModelsSection({
   const canSave = dirty && !!selectedProviderId && !!selectedModel;
 
   return (
-    <Card className={styles.slotSection} title={t("models.defaultLlm")}>
+    <div className={styles.defaultLlmBody}>
+      <p className={styles.llmDescription}>{t("models.llmDescription")}</p>
       <div className={styles.slotForm}>
         <div className={styles.slotField}>
           <label className={styles.slotLabel}>{t("models.provider")}</label>
@@ -186,7 +187,6 @@ export function ModelsSection({
           </Button>
         </div>
       </div>
-      <p className={styles.slotDescription}>{t("models.llmDescription")}</p>
-    </Card>
+    </div>
   );
-}
+});

@@ -1,8 +1,8 @@
 import { Dropdown, Button, type MenuProps } from "antd";
 import {
+  SparkComputerLine,
   SparkMoonLine,
   SparkSunLine,
-  SparkComputerLine,
 } from "@agentscope-ai/icons";
 import { useTheme, type ThemeMode } from "../../contexts/ThemeContext";
 import { useTranslation } from "react-i18next";

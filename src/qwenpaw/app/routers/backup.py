@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 """Backup API – create, list, restore, delete, export, import."""
+
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -13,7 +15,8 @@ from fastapi import APIRouter, Form, HTTPException, Request, UploadFile, File
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from ...backup import (
-    create_stream,
+    BackupManager,
+    BackupOperationConflict,
     delete_backups,
     execute_restore,
     export_backup,
@@ -24,19 +27,125 @@ from ...backup import (
 from ...backup.models import (
     BackupConflictError,
     BackupDetail,
+    BackupJobPhase,
+    BackupJobSnapshot,
+    BackupJobStatus,
     BackupMeta,
+    BackupTrustMode,
+    BackupValidationError,
     CreateBackupRequest,
     DeleteBackupsRequest,
     DeleteBackupsResponse,
     RestoreBackupRequest,
 )
 from ...constant import BACKUP_DIR
+from ...agents.tools import shutdown_browsers_for_workspace_dirs
+from ._backup_helpers import (
+    backup_contains_global_config,
+    parse_pending_token,
+    restored_local_keys,
+    strip_signature,
+    upload_suffix_for_trust_mode,
+    validation_detail,
+)
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/backups", tags=["backups"])
 
 _UPLOAD_TMP_MAX_AGE = 3600  # 1 hour
+_SSE_HEARTBEAT_SECONDS = 15.0
+
+
+def _get_backup_manager(request: Request) -> BackupManager:
+    manager = getattr(request.app.state, "backup_manager", None)
+    if manager is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Backup manager is not available",
+        )
+    return manager
+
+
+def _legacy_event(snapshot: BackupJobSnapshot) -> dict:
+    """Map a job snapshot to the legacy stream event shape."""
+    if snapshot.status == BackupJobStatus.COMPLETED:
+        return {
+            "type": "done",
+            "meta": snapshot.result.model_dump(mode="json"),
+            "percent": 100,
+        }
+    if snapshot.status in {
+        BackupJobStatus.FAILED,
+        BackupJobStatus.CANCELLED,
+    }:
+        return {
+            "type": "error",
+            "message": snapshot.error or "Backup cancelled",
+        }
+    if snapshot.phase == BackupJobPhase.FINALIZING:
+        return {"type": "saving", "percent": snapshot.percent}
+    if snapshot.current_agent:
+        return {
+            "type": "agent",
+            "agent_id": snapshot.current_agent,
+            "index": snapshot.agent_index,
+            "total": snapshot.total_agents,
+            "percent": snapshot.percent,
+        }
+    return {
+        "type": "start",
+        "total_agents": snapshot.total_agents,
+        "percent": 0,
+    }
+
+
+async def _job_event_stream(
+    manager: BackupManager,
+    job_id: str,
+    *,
+    legacy: bool = False,
+):
+    queue = manager.subscribe(job_id)
+    if queue is None:
+        return
+    try:
+        while True:
+            try:
+                snapshot = await asyncio.wait_for(
+                    queue.get(),
+                    timeout=_SSE_HEARTBEAT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                yield ": heartbeat\n\n"
+                continue
+
+            payload = (
+                _legacy_event(snapshot)
+                if legacy
+                else snapshot.model_dump(mode="json")
+            )
+            yield f"data: {json.dumps(payload)}\n\n"
+            if snapshot.status in {
+                BackupJobStatus.COMPLETED,
+                BackupJobStatus.FAILED,
+                BackupJobStatus.CANCELLED,
+            }:
+                break
+    finally:
+        manager.unsubscribe(job_id, queue)
+
+
+def _stream_response(generator) -> StreamingResponse:
+    return StreamingResponse(
+        generator,
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 def _cleanup_stale_uploads() -> None:
@@ -53,7 +162,13 @@ def _cleanup_stale_uploads() -> None:
     if not BACKUP_DIR.is_dir():
         return
     cutoff = time.time() - _UPLOAD_TMP_MAX_AGE
-    for pattern in ("*.upload_tmp", "*.tmp"):
+    for pattern in (
+        "*.upload_tmp",
+        "*.upload_tmp.trust",
+        "*.upload_tmp.trust_legacy",
+        "*.upload_tmp.trust_foreign",
+        "*.tmp",
+    ):
         for f in BACKUP_DIR.glob(pattern):
             try:
                 if f.stat().st_mtime < cutoff:
@@ -62,34 +177,80 @@ def _cleanup_stale_uploads() -> None:
                 pass
 
 
+@router.post(
+    "/jobs",
+    response_model=BackupJobSnapshot,
+    status_code=202,
+    summary="Start a backup creation job",
+)
+async def start_backup_job(req: CreateBackupRequest, request: Request):
+    manager = _get_backup_manager(request)
+    try:
+        return manager.start_job(req)
+    except BackupOperationConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get(
+    "/jobs/active",
+    response_model=BackupJobSnapshot | None,
+    summary="Get the active backup creation job",
+)
+async def get_active_backup_job(request: Request):
+    return _get_backup_manager(request).get_active_job()
+
+
+@router.get(
+    "/jobs/{job_id}",
+    response_model=BackupJobSnapshot,
+    summary="Get a backup creation job",
+)
+async def get_backup_job(job_id: str, request: Request):
+    snapshot = _get_backup_manager(request).get_job(job_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="Backup job not found")
+    return snapshot
+
+
+@router.get(
+    "/jobs/{job_id}/events",
+    summary="Observe a backup creation job via SSE",
+)
+async def backup_job_events(job_id: str, request: Request):
+    manager = _get_backup_manager(request)
+    if manager.get_job(job_id) is None:
+        raise HTTPException(status_code=404, detail="Backup job not found")
+    return _stream_response(_job_event_stream(manager, job_id))
+
+
+@router.post(
+    "/jobs/{job_id}/cancel",
+    response_model=BackupJobSnapshot,
+    summary="Cancel a backup creation job",
+)
+async def cancel_backup_job(job_id: str, request: Request):
+    snapshot = _get_backup_manager(request).cancel_job(job_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="Backup job not found")
+    return snapshot
+
+
 @router.post("/stream", summary="Create backup with SSE progress stream")
-async def create_backup_stream(req: CreateBackupRequest):
-    """Create a backup and stream progress via SSE.
-
-    When the client disconnects the background thread stops at the next agent
-    boundary without writing the final file. Each event is formatted as
-    `data: <json>\\n\\n`; see create_stream for event shapes.
-    """
-
-    async def generate():
-        try:
-            async for event in create_stream(req):
-                yield f"data: {json.dumps(event)}\n\n"
-        except Exception as exc:
-            payload = {"type": "error", "message": str(exc)}
-            yield f"data: {json.dumps(payload)}\n\n"
-
-    return StreamingResponse(
-        generate(),
-        media_type="text/event-stream",
-        # Disable proxy/nginx buffering so events reach the client immediately
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+async def create_backup_stream(req: CreateBackupRequest, request: Request):
+    """Compatibility adapter over the application-owned backup job."""
+    manager = _get_backup_manager(request)
+    try:
+        snapshot = manager.start_job(req)
+    except BackupOperationConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return _stream_response(
+        _job_event_stream(manager, snapshot.job_id, legacy=True),
     )
 
 
 @router.get("", response_model=list[BackupMeta], summary="List backups")
 async def list_backups_route():
-    return await list_backups()
+    return [strip_signature(meta) for meta in await list_backups()]
 
 
 # Fixed-path routes MUST be registered before /{backup_id} to avoid
@@ -110,24 +271,25 @@ async def _handle_pending_import(pending_token: str) -> BackupMeta:
 
     The presence of *pending_token* signals that the user has confirmed the
     overwrite in the UI, so the import is retried with ``overwrite=True``.
+    The token suffix also carries the original explicit trust mode, avoiding a
+    second trust prompt on conflict retry while keeping the server-side trust
+    decision tied to the temp file.
 
     Validates the token against BACKUP_DIR to prevent path traversal, then
     removes the temp file when done (whether the import succeeds or fails).
     """
-    tmp_path = (BACKUP_DIR / pending_token).resolve()
-    # Guard against path traversal: resolved path must stay inside BACKUP_DIR
-    if not tmp_path.is_relative_to(BACKUP_DIR.resolve()):
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid or expired pending_token",
-        )
-    if not tmp_path.is_file() or tmp_path.suffix != ".upload_tmp":
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid or expired pending_token",
-        )
+    tmp_path, trust_mode = parse_pending_token(pending_token)
     try:
-        return await import_backup(tmp_path, overwrite=True)
+        return await import_backup(
+            tmp_path,
+            overwrite=True,
+            trust_mode=trust_mode,
+        )
+    except BackupValidationError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=validation_detail(exc),
+        ) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -138,6 +300,8 @@ async def _handle_pending_import(pending_token: str) -> BackupMeta:
 
 async def _handle_fresh_upload(
     file: UploadFile,
+    *,
+    trust_mode: BackupTrustMode | None = None,
 ) -> BackupMeta | JSONResponse:
     """Save the uploaded zip to a temp file and attempt an import.
 
@@ -159,15 +323,18 @@ async def _handle_fresh_upload(
             ),
         )
 
-    tmp_fd, tmp_name = tempfile.mkstemp(dir=BACKUP_DIR, suffix=".upload_tmp")
+    suffix = upload_suffix_for_trust_mode(trust_mode)
+    # Keep trusted and untrusted pending uploads distinguishable after a 409
+    # conflict. The retry endpoint only accepts filenames inside BACKUP_DIR.
+    tmp_fd, tmp_name = tempfile.mkstemp(dir=BACKUP_DIR, suffix=suffix)
     tmp_path = Path(tmp_name)
     try:
         with os.fdopen(tmp_fd, "wb") as fp:
             while chunk := await file.read(1024 * 1024):
                 fp.write(chunk)
 
-        result = await import_backup(tmp_path)
-        # The no-conflict path renames tmp_path → dest (unlink is a no-op).
+        result = await import_backup(tmp_path, trust_mode=trust_mode)
+        # The no-conflict path renames tmp_path to dest (unlink is a no-op).
         # Other paths only read tmp_path, so we always clean up here.
         tmp_path.unlink(missing_ok=True)
         return result
@@ -178,10 +345,16 @@ async def _handle_fresh_upload(
             status_code=409,
             content={
                 "detail": "backup_conflict",
-                "existing": meta.model_dump(mode="json"),
+                "existing": strip_signature(meta).model_dump(mode="json"),
                 "pending_token": tmp_path.name,
             },
         )
+    except BackupValidationError as exc:
+        tmp_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=400,
+            detail=validation_detail(exc),
+        ) from exc
     except ValueError as exc:
         tmp_path.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -194,6 +367,7 @@ async def _handle_fresh_upload(
 async def import_backup_route(
     file: UploadFile = File(default=None, description="Backup zip archive"),
     pending_token: str | None = Form(default=None),
+    trust_mode: BackupTrustMode | None = Form(default=None),
 ):
     """Import a backup zip uploaded by the client.
 
@@ -212,7 +386,7 @@ async def import_backup_route(
     if file is None:
         raise HTTPException(status_code=400, detail="file is required")
 
-    return await _handle_fresh_upload(file)
+    return await _handle_fresh_upload(file, trust_mode=trust_mode)
 
 
 @router.get(
@@ -224,7 +398,9 @@ async def get_backup_route(backup_id: str):
     detail = await get_backup(backup_id)
     if detail is None:
         raise HTTPException(status_code=404, detail="Backup not found")
-    return detail
+    payload = strip_signature(detail).model_dump()
+    payload["workspace_stats"] = detail.workspace_stats
+    return BackupDetail.model_validate(payload)
 
 
 @router.post("/{backup_id}/restore", summary="Restore backup")
@@ -233,26 +409,48 @@ async def restore_backup(
     req: RestoreBackupRequest,
     request: Request,
 ):
-    manager = getattr(request.app.state, "multi_agent_manager", None)
+    backup_manager = _get_backup_manager(request)
+    agent_manager = getattr(request.app.state, "multi_agent_manager", None)
     try:
-        await execute_restore(
-            backup_id,
-            req,
-            stop_agent_fn=manager.stop_agent if manager else None,
-            preload_agent_fn=manager.preload_agent if manager else None,
-            list_running_agent_ids_fn=(
-                manager.list_loaded_agents if manager else None
-            ),
-        )
+        with backup_manager.reserve_restore():
+            meta = await execute_restore(
+                backup_id,
+                req,
+                stop_agent_fn=(
+                    agent_manager.stop_agent if agent_manager else None
+                ),
+                # Contractual order: stop agent, browsers, then replace files.
+                stop_browsers_fn=shutdown_browsers_for_workspace_dirs,
+                preload_agent_fn=(
+                    agent_manager.preload_agent if agent_manager else None
+                ),
+                list_running_agent_ids_fn=(
+                    agent_manager.list_loaded_agents if agent_manager else None
+                ),
+            )
+    except BackupOperationConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except FileNotFoundError as exc:
         raise HTTPException(
             status_code=404,
             detail="Backup not found",
         ) from exc
+    except BackupValidationError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=validation_detail(exc),
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    return {"ok": True}
+    preserved = restored_local_keys(
+        req,
+        meta,
+        archive_has_global_config=backup_contains_global_config(backup_id),
+    )
+    return {"ok": True, "preserved_local_keys": preserved}
 
 
 @router.get("/{backup_id}/export", summary="Export backup as zip")

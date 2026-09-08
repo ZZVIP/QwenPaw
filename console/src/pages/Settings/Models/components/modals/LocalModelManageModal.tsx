@@ -859,6 +859,7 @@ export function LocalModelManageModal({
       onCancel={handleClose}
       footer={null}
       width={800}
+      className={styles.modelManageModal}
       destroyOnHidden
     >
       {(loadingLocal || loadingStatus || loadingLocalConfig) &&
@@ -920,7 +921,7 @@ export function LocalModelManageModal({
                         percent={currentModelDownloadPercent ?? 0}
                         showInfo={false}
                         status="active"
-                        strokeColor="#ff7f16"
+                        strokeColor="var(--app-accent)"
                         strokeWidth={10}
                       />
                       <Tooltip title={t("models.localCancelDownloadAction")}>
